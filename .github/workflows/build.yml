@@ -51,7 +51,7 @@ jobs:
             src/gbnf_parser.cpp src/gbnf_runtime.cpp tests/test_gbnf.cpp -o /tmp/test_gbnf
           /tmp/test_gbnf
 
-      - name: Build & run NEON self-test (x86 runner: verifies graceful N/A report, not NEON itself)
+      - name: "Build & run NEON self-test (x86 runner: verifies graceful N/A report, not NEON itself)"
         run: |
           cd core
           g++ -std=c++17 -Wall -Wextra -I include \
