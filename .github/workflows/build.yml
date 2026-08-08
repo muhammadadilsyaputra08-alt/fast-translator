@@ -1,0 +1,151 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK & CMake
+        run: |
+          sdkmanager --install "ndk;27.0.12077973" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build core engine unit tests (Fase 1 + engine layer, desktop g++)
+        run: |
+          cd core
+          g++ -std=c++17 -Wall -Wextra -pthread -I include \
+            src/fllm_parser.cpp src/bitnet_kernel.cpp src/kv_cache.cpp src/medusa.cpp src/engine.cpp src/transformer.cpp src/transformer_mixed.cpp src/tokenizer.cpp src/gbnf_parser.cpp src/gbnf_runtime.cpp \
+            tests/test_fase1.cpp -o /tmp/test_fase1
+          /tmp/test_fase1
+          g++ -std=c++17 -Wall -Wextra -pthread -I include \
+            src/fllm_parser.cpp src/bitnet_kernel.cpp src/kv_cache.cpp src/medusa.cpp src/engine.cpp src/transformer.cpp src/transformer_mixed.cpp src/tokenizer.cpp src/gbnf_parser.cpp src/gbnf_runtime.cpp \
+            tests/test_engine.cpp -o /tmp/test_engine
+          /tmp/test_engine
+
+      - name: Build & run GBNF grammar tests (parser + constrained-decoding state machine)
+        run: |
+          cd core
+          g++ -std=c++17 -O2 -Wall -Wextra -I include \
+            src/gbnf_parser.cpp src/gbnf_runtime.cpp tests/test_gbnf.cpp -o /tmp/test_gbnf
+          /tmp/test_gbnf
+
+      - name: Build & run NEON self-test (x86 runner: verifies graceful N/A report, not NEON itself)
+        run: |
+          cd core
+          g++ -std=c++17 -Wall -Wextra -I include \
+            src/transformer_mixed.cpp src/kv_cache.cpp src/neon_selftest.cpp tests/test_neon_selftest.cpp -o /tmp/test_neon_selftest
+          /tmp/test_neon_selftest
+
+      - name: Build & run real-model tests (stories15M via Git LFS)
+        run: |
+          cd core
+          g++ -std=c++17 -O2 -Wall -Wextra -I include src/transformer.cpp src/tokenizer.cpp \
+            tests/test_real_model.cpp -o /tmp/test_real_model
+          /tmp/test_real_model ../models/stories15M.bin ../models/tokenizer.bin
+          g++ -std=c++17 -O2 -Wall -Wextra -pthread -I include \
+            src/fllm_parser.cpp src/bitnet_kernel.cpp src/kv_cache.cpp src/medusa.cpp src/engine.cpp src/transformer.cpp src/transformer_mixed.cpp src/tokenizer.cpp src/gbnf_parser.cpp src/gbnf_runtime.cpp \
+            tests/test_engine_real_model.cpp -o /tmp/test_engine_real_model
+          /tmp/test_engine_real_model ../models/stories15M.bin ../models/tokenizer.bin
+
+      - name: Pack production .fllm (INT8-quantized, RocketKV enabled — see notes/)
+        run: |
+          cd tools
+          g++ -std=c++17 -O2 -I ../core/include ../core/src/fllm_parser.cpp ../core/src/bitnet_kernel.cpp \
+            pack_fllm.cpp -o /tmp/pack_fllm
+          /tmp/pack_fllm ../models/stories15M.bin ../models/tokenizer.bin /tmp/model.fllm
+
+      - name: Build & run KV-cache eviction tests (RocketKV correctness + memory savings)
+        run: |
+          cd core
+          g++ -std=c++17 -O2 -Wall -Wextra -I include \
+            src/fllm_parser.cpp src/transformer_mixed.cpp src/tokenizer.cpp src/kv_cache.cpp \
+            tests/test_kv_eviction.cpp -o /tmp/test_kv_eviction
+          /tmp/test_kv_eviction /tmp/model.fllm
+
+      - name: Build & run grammar-constrained generation test (end-to-end, forces JSON via production engine)
+        run: |
+          cd core
+          g++ -std=c++17 -O2 -Wall -Wextra -pthread -I include \
+            src/fllm_parser.cpp src/bitnet_kernel.cpp src/kv_cache.cpp src/medusa.cpp src/engine.cpp src/transformer.cpp src/transformer_mixed.cpp src/tokenizer.cpp src/gbnf_parser.cpp src/gbnf_runtime.cpp \
+            tests/test_grammar_sampling.cpp -o /tmp/test_grammar_sampling
+          /tmp/test_grammar_sampling /tmp/model.fllm
+
+      - name: Verify production .fllm quality (perplexity must stay near fp32 baseline)
+        run: |
+          cd tools
+          g++ -std=c++17 -O2 -I ../core/include \
+            ../core/src/transformer.cpp ../core/src/transformer_bitnet.cpp ../core/src/transformer_mixed.cpp \
+            ../core/src/tokenizer.cpp ../core/src/fllm_parser.cpp ../core/src/kv_cache.cpp eval_perplexity.cpp -o /tmp/eval_perplexity
+          echo "--- fp32 baseline ---"
+          /tmp/eval_perplexity fp32 ../models/stories15M.bin ../models/tokenizer.bin
+          echo "--- packed production .fllm (INT8 everywhere; should be close to fp32) ---"
+          /tmp/eval_perplexity int8all /tmp/model.fllm
+
+      - name: Upload production .fllm model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-fllm-production
+          path: /tmp/model.fllm
+
+      - name: Generate dummy .fllm model for on-device testing
+        run: |
+          cd tools
+          g++ -std=c++17 -I ../core/include ../core/src/fllm_parser.cpp make_dummy_model.cpp -o /tmp/make_dummy_model
+          /tmp/make_dummy_model /tmp/demo.fllm
+
+      - name: Upload dummy model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-fllm-model
+          path: /tmp/demo.fllm
+
+      - name: Build debug APK (auto-signed with AGP's debug keystore — installable directly on device)
+        run: |
+          cd android
+          gradle assembleDebug --no-daemon
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fasttranslator-app-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+
+      - name: Build release APK (UNSIGNED — for CI verification only, not installable as-is)
+        run: |
+          cd android
+          gradle assembleRelease --no-daemon
+
+      - name: Upload release APK artifact (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fasttranslator-app-release-unsigned
+          path: android/app/build/outputs/apk/release/*.apk
+
+      - name: Upload native .so for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfastai-so
+          path: android/app/build/intermediates/merged_native_libs/**/lib/**/*.so
+          if-no-files-found: ignore
