@@ -1,0 +1,41 @@
+#version 450
+
+// Satu invocation per baris output (o). Loop dalam atas d_in -- sengaja
+// simple/correctness-first dulu (sama seperti kita mulai dari CPU thread
+// pool yang paling sederhana sebelum optimasi lebih jauh).
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer XBuf   { float x[]; };
+layout(std430, binding = 1) readonly buffer WBuf   { int   w[]; }; // int8 dikemas 4-per-int, lihat unpack di bawah
+layout(std430, binding = 2) writeonly buffer OutBuf{ float outp[]; };
+
+layout(push_constant) uniform PC {
+    int d_in;
+    int d_out;
+    float scale;
+} pc;
+
+// w disimpan host-side sebagai int8_t mentah; di-upload sebagai buffer byte
+// dan dibaca di sini per-byte lewat bitfieldExtract dari kata 32-bit, supaya
+// tidak perlu ekstensi GL_EXT_shader_8bit_storage (kompatibilitas driver
+// mobile lebih luas tanpa ekstensi tambahan).
+int readInt8(uint byteIndex) {
+    uint wordIndex = byteIndex / 4u;
+    uint byteInWord = byteIndex % 4u;
+    int word = w[wordIndex];
+    int shifted = bitfieldExtract(word, int(byteInWord) * 8, 8);
+    return shifted;
+}
+
+void main() {
+    uint o = gl_GlobalInvocationID.x;
+    if (int(o) >= pc.d_out) return;
+
+    float acc = 0.0;
+    uint rowBase = o * uint(pc.d_in);
+    for (int i = 0; i < pc.d_in; ++i) {
+        int wi = readInt8(rowBase + uint(i));
+        acc += float(wi) * x[i];
+    }
+    outp[o] = acc * pc.scale;
+}
